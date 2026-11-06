@@ -24,6 +24,25 @@ load_dotenv()
 from analytics import build_analytics
 from analytics import dept_category as _dept_category
 from analytics import group_key as _group_key
+
+
+# Map a room code prefix to the human-facing venue name. VAN campus uses
+# HC = Harbour Centre, WCC = Wosk Conference Centre, SG = Segal Building.
+# Longest prefix first so "WCC..." doesn't greedy-match on an "W" bucket.
+_VENUE_PREFIXES = (
+    ("WCC", "Wosk Conference Centre"),
+    ("SG",  "Segal Building"),
+    ("HC",  "Harbour Centre"),
+)
+
+
+def _venue_of(room: str) -> str:
+    """Bucket a room code into its venue — "HC 1400-1430" → "Harbour Centre"."""
+    r = (room or "").strip()
+    for prefix, name in _VENUE_PREFIXES:
+        if r.startswith(prefix):
+            return name
+    return ""
 from database import (add_note, clear_tick, count_events, count_events_in_range,
                       delete_all_events, delete_event, delete_events,
                       delete_events_in_range, delete_note, get_comments_report,
@@ -311,6 +330,11 @@ def api_events():
                 "attendance":     e.get("attendance", ""),
                 "department":     e.get("department", ""),
                 "dept_category":  _dept_category(e.get("department", ""), e.get("service_type", "")),
+                "venue":          _venue_of(e.get("room", "")),
+                # Native ISO copies of the event's date/end used client-side for
+                # the live "has this ended yet" check that fades past events.
+                "event_date_iso": e.get("date", ""),
+                "event_end_iso":  end_iso,
                 "layout_image":   e.get("layout_image", ""),
                 "layout_images":  e.get("layout_images", []),
                 "checked_items":  e.get("checked_items", []),

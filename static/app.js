@@ -311,7 +311,7 @@ let groupedMode = false;
 let showHidden  = false;   // reveal events that users have hidden
 // Past events are shown by default (greyed + badged); the toggle collapses them.
 let showPast    = true;    // reveal events whose group's last instance has passed
-const FILTERS = { depts: new Set(), q: '', cancelledOnly: false };
+const FILTERS = { depts: new Set(), venues: new Set(), q: '', cancelledOnly: false };
 let _searchTimer = null;   // debounce handle for the search box
 
 // ── Saved filters (per-browser) ───────────────────────────────────────────
@@ -323,6 +323,7 @@ function saveFilters() {
   const search = document.getElementById('event-search');
   const saved = {
     depts: [...FILTERS.depts],
+    venues: [...FILTERS.venues],
     q: search ? search.value : FILTERS.q,
     cancelledOnly: FILTERS.cancelledOnly,
   };
@@ -335,6 +336,9 @@ function loadFilters() {
   if (!saved || typeof saved !== 'object') return;
   if (Array.isArray(saved.depts)) {
     saved.depts.forEach(d => { if (typeof d === 'string') FILTERS.depts.add(d); });
+  }
+  if (Array.isArray(saved.venues)) {
+    saved.venues.forEach(v => { if (typeof v === 'string') FILTERS.venues.add(v); });
   }
   if (typeof saved.q === 'string') {
     FILTERS.q = saved.q.trim().toLowerCase();
@@ -461,6 +465,11 @@ document.addEventListener('DOMContentLoaded', () => {
     slotMaxTime: '22:00:00',
     nowIndicator: true,
     eventMaxStack: 4,
+    // Month view collapses to "+N more" past this many, so a conference day
+    // with 30+ stacked rooms stays scannable. The expanded popover carries
+    // the same classes / click-to-open behaviour.
+    dayMaxEvents: 6,
+    moreLinkText: n => `+${n} more`,
   });
 
   calendar.render();
@@ -476,6 +485,12 @@ document.addEventListener('DOMContentLoaded', () => {
     if (document.hidden || _currentEventId != null) return;
     calendar.refetchEvents();
   }, 20000);
+
+  // Every minute, re-check whether each currently-rendered event has slipped
+  // into the past and toggle .event-past accordingly. This is what gives the
+  // calendar its "events fade as the day goes by" feel without re-rendering
+  // the whole calendar — and without any server round-trip.
+  setInterval(tickPastEvents, 60 * 1000);
 
   // Open-modal tick refresh: every 20s pull just the current event's ticks and
   // re-paint the inline stamps. No modal state is otherwise touched, so note
@@ -701,6 +716,7 @@ function applyFilters(list) {
     if (!showPast && p.group_past) return false;
     if (FILTERS.cancelledOnly && p.status !== 'cancelled') return false;
     if (FILTERS.depts.size && !FILTERS.depts.has(p.dept_category)) return false;
+    if (FILTERS.venues.size && !FILTERS.venues.has(p.venue || '')) return false;
     if (FILTERS.q) {
       // Free-text search across event number, room/location, and event name
       const hay = `${p.event_number || ''} ${p.room || ''} ${e.title || ''}`.toLowerCase();
@@ -714,7 +730,8 @@ function applyFilters(list) {
 // that category, so the four categories VAN cares about every day (AV, MECS,
 // Catering, Facilities) stay a single tap away and don't disappear on a slow
 // day with zero of any one of them.
-const PINNED_DEPT_CHIPS = ['AV', 'MECS', 'Catering', 'Facilities'];
+const PINNED_DEPT_CHIPS   = ['AV', 'MECS', 'Catering', 'Facilities'];
+const PINNED_VENUE_CHIPS  = ['Harbour Centre', 'Wosk Conference Centre', 'Segal Building'];
 
 function buildFilterBar(list) {
   // Department chips (with counts). Pinned chips go first in their fixed
@@ -744,6 +761,35 @@ function buildFilterBar(list) {
             </button>`;
   }).join('');
 
+  // Venue chips — Harbour Centre first, then Wosk, then Segal. Any other venue
+  // (none derivable from the room code, e.g. '') appears last if present.
+  const venueCounts = {};
+  for (const e of list) {
+    const v = e.extendedProps.venue || '';
+    if (v) venueCounts[v] = (venueCounts[v] || 0) + 1;
+  }
+  for (const v of PINNED_VENUE_CHIPS) if (!(v in venueCounts)) venueCounts[v] = 0;
+  for (const v of FILTERS.venues)    if (!(v in venueCounts)) venueCounts[v] = 0;
+  const venueOrder = PINNED_VENUE_CHIPS.concat(
+    Object.keys(venueCounts).filter(v => !PINNED_VENUE_CHIPS.includes(v))
+                            .sort((a, b) => venueCounts[b] - venueCounts[a] || a.localeCompare(b))
+  );
+  const venueChips = venueOrder.map(v => {
+    const active = FILTERS.venues.has(v);
+    const empty  = (venueCounts[v] || 0) === 0;
+    const cls = ['dept-chip', 'venue-chip', active && 'active', empty && 'empty'].filter(Boolean).join(' ');
+    // Short labels on the chip itself so the row stays scannable on an iPad.
+    const short = v === 'Harbour Centre' ? 'HC'
+               : v === 'Wosk Conference Centre' ? 'Wosk'
+               : v === 'Segal Building' ? 'Segal'
+               : v;
+    return `<button class="${cls}"
+              onclick="App.toggleVenue('${v.replace(/'/g, "\\'")}')"
+              title="${escHtml(v)}">
+              ${escHtml(short)} <span class="dept-chip-count">${venueCounts[v] || 0}</span>
+            </button>`;
+  }).join('');
+
   // Status filter: show only cancelled events (sits alongside the dept chips)
   const cancelledCount = list.filter(e => e.extendedProps.status === 'cancelled').length;
   const cancelledChip = cancelledCount
@@ -754,7 +800,13 @@ function buildFilterBar(list) {
        </button>`
     : '';
 
-  chipWrap.innerHTML = (deptChips + cancelledChip)
+  const venueGroup = venueChips
+    ? `<span class="chip-group venue-group">${venueChips}</span>`
+    : '';
+  const deptGroup = deptChips
+    ? `<span class="chip-group dept-group">${deptChips}</span>`
+    : '';
+  chipWrap.innerHTML = (venueGroup + deptGroup + cancelledChip)
     || '<span class="filter-empty">No events loaded</span>';
 
   updateFilterMeta(list.length);
@@ -762,7 +814,7 @@ function buildFilterBar(list) {
 
 function updateFilterMeta(total) {
   const shown  = applyFilters(ALL_EVENTS).length;
-  const active = FILTERS.depts.size > 0 || !!FILTERS.q || FILTERS.cancelledOnly;
+  const active = FILTERS.depts.size > 0 || FILTERS.venues.size > 0 || !!FILTERS.q || FILTERS.cancelledOnly;
   const meta   = document.getElementById('filter-count');
   const clear  = document.getElementById('clear-filters');
   meta.textContent = active ? `Showing ${shown} of ${total}` : plural(total, 'event');
@@ -780,10 +832,29 @@ function eventIsComplete(p) {
   return checked >= total;
 }
 
-// An event is "past" once its group's LAST instance has passed. Computed
-// server-side (across the whole schedule) and delivered as `group_past`.
+// An event is "past" once its own end-of-day moment has passed OR its group's
+// LAST instance has passed. The per-event check is driven live off the wall
+// clock (nowMs), so as the day progresses events fade one by one. The
+// group-wide check (computed server-side, delivered as `group_past`) catches
+// multi-day event groups whose last instance is already in history.
 function eventIsPast(p) {
-  return !!(p && p.group_past);
+  if (!p) return false;
+  if (p.group_past) return true;
+  if (!p.event_date_iso) return false;
+  const endIso = p.event_end_iso || p.event_date_iso + 'T23:59';
+  const endMs = Date.parse(endIso);
+  if (isNaN(endMs)) return false;
+  return endMs <= _nowMs();
+}
+
+let _nowMsCache = 0;
+let _nowMsStamp = 0;
+function _nowMs() {
+  // Memoized per tick (10s) so a dense list re-render doesn't query Date.now()
+  // on every event. tickPastEvents() invalidates by advancing the stamp.
+  const t = Date.now();
+  if (t - _nowMsStamp > 10000) { _nowMsCache = t; _nowMsStamp = t; }
+  return _nowMsCache;
 }
 
 // Label for the setup-progress badge — turns into a "✓ Complete" state.
@@ -1426,6 +1497,20 @@ async function refreshOpenModalTicks() {
   });
 }
 
+// Re-tag every rendered event with .event-past if its end is now in the past.
+// Leaves non-past events untouched so CSS transitions remain cheap.
+function tickPastEvents() {
+  if (typeof calendar === 'undefined' || !calendar) return;
+  _nowMsStamp = 0; // force _nowMs() to refresh
+  const events = calendar.getEvents();
+  for (const ev of events) {
+    const el = ev.el || document.querySelector(`[data-event-id="${ev.id}"]`);
+    if (!el) continue;
+    const past = eventIsPast(ev.extendedProps);
+    el.classList.toggle('event-past', past);
+  }
+}
+
 function fmtServerUtcNow() {
   const d = new Date();
   const p = n => String(n).padStart(2, '0');
@@ -1640,6 +1725,13 @@ const App = {
     calendar.refetchEvents();
   },
 
+  toggleVenue(venue) {
+    if (FILTERS.venues.has(venue)) FILTERS.venues.delete(venue);
+    else                           FILTERS.venues.add(venue);
+    saveFilters();
+    calendar.refetchEvents();
+  },
+
   setSearch(text) {
     FILTERS.q = (text || '').trim().toLowerCase();
     saveFilters();
@@ -1659,6 +1751,7 @@ const App = {
 
   clearFilters() {
     FILTERS.depts.clear();
+    FILTERS.venues.clear();
     FILTERS.q = '';
     FILTERS.cancelledOnly = false;
     const search = document.getElementById('event-search');

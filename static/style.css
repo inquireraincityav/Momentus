@@ -1,4 +1,9 @@
 /* ── Reset & base ─────────────────────────────────────────────────────────── */
+/* Pin the site to light mode regardless of the user's OS "Dark" setting. The
+   dark-mode @media blocks below are disabled by rewriting their query to a
+   never-matching one (see the "not all" guards). color-scheme: light also
+   keeps form controls / scrollbars rendered in their light-mode defaults. */
+:root { color-scheme: light; }
 html { height: 100%; }
 *, *::before, *::after { box-sizing: border-box; }
 
@@ -669,6 +674,15 @@ body {
 .dept-chip.empty:hover { opacity: 1; }
 .dept-chip.empty.active { opacity: 1; }
 
+/* Venue chips sit in their own group ahead of the department chips; a small
+   vertical divider between the groups keeps the eye from mixing them. */
+.chip-group { display: inline-flex; gap: .4rem; align-items: center; }
+.chip-group.venue-group { padding-right: .6rem; margin-right: .2rem;
+                          border-right: 1px solid #E8C4CB; }
+.dept-chip.venue-chip { background: #FBEAEE; color: #8E1327; border-color: #E8C4CB; }
+.dept-chip.venue-chip:hover { background: #F6D6DC; }
+.dept-chip.venue-chip.active { background: #A6192E; color: #fff; border-color: #A6192E; }
+
 /* Status filter chip — cancelled events */
 .cancelled-chip {
   color: #c0392b;
@@ -1139,7 +1153,7 @@ body {
 #calendar-wrap { -webkit-overflow-scrolling: touch; }
 
 /* ── Dark mode ────────────────────────────────────────────────────────────── */
-@media (prefers-color-scheme: dark) {
+@media not all and (prefers-color-scheme: dark) {
 
   /* FullCalendar CSS custom properties */
   :root {
@@ -1699,7 +1713,7 @@ body.analytics-body { overflow: hidden; }
 }
 
 /* ── Dark mode ─────────────────────────────────────────────────────────────── */
-@media (prefers-color-scheme: dark) {
+@media not all and (prefers-color-scheme: dark) {
   .semester-pill {
     background: #262a3d;
     border-color: #363b52;
@@ -1898,7 +1912,7 @@ body.analytics-body { overflow: hidden; }
   .reaction-picker button { font-size: 1.3rem; padding: 6px; }
 }
 
-@media (prefers-color-scheme: dark) {
+@media not all and (prefers-color-scheme: dark) {
   .comment-inbox { background: #1c1f2b; color: #e2e4f0; border-color: #2e3044; box-shadow: 0 12px 32px rgba(0,0,0,.5); }
   .inbox-head { border-bottom-color: #2a2d3d; }
   .inbox-total { background: #4a3a10; color: #f5c869; }
@@ -1989,7 +2003,7 @@ body.selecting #calendar-wrap { padding-bottom: 84px; }
   .select-toggle { align-self: flex-end; }
 }
 
-@media (prefers-color-scheme: dark) {
+@media not all and (prefers-color-scheme: dark) {
   .select-toggle { color: #a5adc4; border-color: #3a3f55; }
   .select-toggle:hover { color: #DDA7B0; border-color: #A6192E; }
   .select-toggle.active { background: #A6192E; border-color: #A6192E; color: #fff; }
@@ -2053,7 +2067,7 @@ body.report-body { height: auto; min-height: 100dvh; overflow: auto; display: bl
 .report-comment-text { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
 .report-comment-extra { display: flex; gap: 12px; color: #6c757d; font-size: .8rem; margin-top: 4px; }
 
-@media (prefers-color-scheme: dark) {
+@media not all and (prefers-color-scheme: dark) {
   .report-kpis div, .report-event { background: #1c1f2b; border-color: #2e3044; }
   .report-kpis strong, .report-count { color: #DDA7B0; }
   .report-count { background: #262a45; }
