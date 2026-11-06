@@ -6,8 +6,10 @@ Production:      gunicorn -w 2 -b 0.0.0.0:8000 app:app
 """
 
 import csv
+import hashlib
 import io
 import os
+import re
 import secrets
 import time
 import uuid
@@ -191,13 +193,49 @@ def _venue_time(ts) -> str:
     return dt.replace(tzinfo=timezone.utc).astimezone(_venue_tz()).strftime("%Y-%m-%d %H:%M")
 
 
+# Files whose mtime feeds the service-worker cache version. Edit any of them
+# and the SW's CACHE constant changes, which forces every installed iPad to
+# drop its old shell cache and refetch on the next load — no manual version
+# bump per commit.
+_SW_FINGERPRINT_FILES = ("shift.js", "style.css", "manifest.json", "sw.js")
+
+
+def _sw_cache_version() -> str:
+    """Short hash of the shift-view asset mtimes + the template mtime."""
+    h = hashlib.sha1()
+    for name in _SW_FINGERPRINT_FILES:
+        p = os.path.join(app.static_folder, name)
+        try:
+            h.update(name.encode())
+            h.update(str(int(os.path.getmtime(p))).encode())
+        except OSError:
+            pass
+    try:
+        tmpl = os.path.join(app.root_path, "templates", "shift.html")
+        h.update(str(int(os.path.getmtime(tmpl))).encode())
+    except OSError:
+        pass
+    return h.hexdigest()[:10]
+
+
 @app.route("/sw.js")
 def service_worker():
     """Serve the shift-view service worker from the site root so its scope
     covers /today, /tomorrow and /api/events (a file served from /static/ would
-    be scoped to /static/ and couldn't intercept them)."""
-    resp = send_from_directory(app.static_folder, "sw.js")
-    # Service workers need a fresh copy each visit so updates roll out.
+    be scoped to /static/ and couldn't intercept them). Also inject a build
+    fingerprint into the CACHE constant so each code change auto-invalidates
+    every installed iPad's old cache."""
+    with open(os.path.join(app.static_folder, "sw.js"), "r", encoding="utf-8") as f:
+        src = f.read()
+    version = f"hygd-shift-{_sw_cache_version()}"
+    # Replace the entire quoted name on the CACHE= line, keyed off the sentinel.
+    src = re.sub(
+        r"const CACHE = '[^']*';\s*/\*__HYGD_CACHE_VERSION__\*/",
+        f"const CACHE = '{version}'; /*__HYGD_CACHE_VERSION__*/",
+        src, count=1,
+    )
+    resp = Response(src, mimetype="application/javascript")
+    # Browsers must revalidate /sw.js on every visit so edits reach iPads fast.
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["Service-Worker-Allowed"] = "/"
     return resp

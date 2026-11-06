@@ -11,7 +11,14 @@
 //   • GET /api/events?... — network-first, cache on success, fall back to cache
 //   • Writes (POST/DELETE) — pass through. The page's outbox retries on reconnect.
 
-const CACHE = 'hygd-shift-v1';
+// CACHE is pinned to a hash of the shift-view asset mtimes, injected by the
+// Flask /sw.js route (see service_worker() in app.py). Any edit to shift.js,
+// style.css, shift.html, manifest.json or this file bumps the hash, which
+// changes the cache name here, which forces every installed iPad to drop the
+// old cache and refetch everything in the SHELL list on the next load.
+// Running /sw.js standalone (opened as a static file) keeps v0, which is fine
+// for local debugging.
+const CACHE = 'hygd-shift-v0';  /*__HYGD_CACHE_VERSION__*/
 
 const SHELL = [
   '/today',
