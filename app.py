@@ -24,13 +24,13 @@ load_dotenv()
 from analytics import build_analytics
 from analytics import dept_category as _dept_category
 from analytics import group_key as _group_key
-from database import (add_note, count_events, count_events_in_range,
+from database import (add_note, clear_tick, count_events, count_events_in_range,
                       delete_all_events, delete_event, delete_events,
                       delete_events_in_range, delete_note, get_comments_report,
                       get_event_by_id, get_events, get_notes,
                       get_unread_notes, init_db, save_events,
                       set_event_hidden, set_events_hidden, set_event_progress,
-                      toggle_reaction, update_note)
+                      set_tick, toggle_reaction, update_note)
 from parser import extract_and_parse_pdf
 
 app = Flask(__name__)
@@ -83,6 +83,26 @@ def _security_headers(resp: Response) -> Response:
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/today")
+def today_page():
+    d = datetime.now(_venue_tz()).date()
+    return render_template(
+        "shift.html", view="today", view_label="Today",
+        date=d.isoformat(), pretty_date=d.strftime("%A, %b %d"),
+        event_count=count_events_in_range(d.isoformat(), d.isoformat()),
+    )
+
+
+@app.route("/tomorrow")
+def tomorrow_page():
+    d = (datetime.now(_venue_tz()) + timedelta(days=1)).date()
+    return render_template(
+        "shift.html", view="tomorrow", view_label="Tomorrow",
+        date=d.isoformat(), pretty_date=d.strftime("%A, %b %d"),
+        event_count=count_events_in_range(d.isoformat(), d.isoformat()),
+    )
 
 
 @app.route("/analytics")
@@ -169,6 +189,18 @@ def _venue_time(ts) -> str:
     except ValueError:
         return str(ts)
     return dt.replace(tzinfo=timezone.utc).astimezone(_venue_tz()).strftime("%Y-%m-%d %H:%M")
+
+
+@app.route("/sw.js")
+def service_worker():
+    """Serve the shift-view service worker from the site root so its scope
+    covers /today, /tomorrow and /api/events (a file served from /static/ would
+    be scoped to /static/ and couldn't intercept them)."""
+    resp = send_from_directory(app.static_folder, "sw.js")
+    # Service workers need a fresh copy each visit so updates roll out.
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Service-Worker-Allowed"] = "/"
+    return resp
 
 
 @app.route("/layouts/<path:filename>")
@@ -287,6 +319,7 @@ def api_events():
                 "checked_items":  e.get("checked_items", []),
                 "manually_complete": bool(e.get("manually_complete", 0)),
                 "assistant_note": e.get("assistant_note", ""),
+                "ticks":          e.get("ticks", []),
                 "group_key":      group_key,
                 "status":         e.get("status", "active"),
                 "updated_at":     e.get("updated_at", ""),
@@ -330,6 +363,55 @@ def api_event_progress(event_id):
 
     if not set_event_progress(event_id, checked, note, manual):
         return jsonify({"error": "event not found"}), 404
+    return jsonify({"success": True})
+
+
+# ── Typed ticks API (Phase 1: setup vs check-in, with initials + timestamp) ────
+
+_TICK_KINDS = ("setup", "checkin")
+
+
+@app.route("/api/events/<int:event_id>/tick", methods=["POST"])
+def api_tick(event_id):
+    """Record (or re-record) one typed tick.
+
+    Body: {"item_index": <int>, "kind": "setup"|"checkin", "initials": "JD",
+           "ticked_at": "YYYY-MM-DD HH:MM:SS"?}
+
+    item_index = -1 is the whole-event tick; >= 0 targets a setup_items row.
+    ticked_at is optional — pass it for offline-captured ticks so the server
+    stores the real wall-clock time, not the sync time.
+    """
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get("kind", "")).strip()
+    if kind not in _TICK_KINDS:
+        return jsonify({"error": "kind must be 'setup' or 'checkin'"}), 400
+    try:
+        item_index = int(data.get("item_index"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_index required"}), 400
+    initials = str(data.get("initials", "")).strip()[:8]
+    if not initials:
+        return jsonify({"error": "initials required"}), 400
+    ticked_at = data.get("ticked_at")
+    if ticked_at is not None:
+        ticked_at = str(ticked_at)[:19]
+    if not set_tick(event_id, item_index, kind, initials, ticked_at):
+        return jsonify({"error": "event not found"}), 404
+    return jsonify({"success": True})
+
+
+@app.route("/api/events/<int:event_id>/tick", methods=["DELETE"])
+def api_tick_clear(event_id):
+    """Remove one typed tick. Query: ?kind=setup|checkin&item_index=<int>"""
+    kind = (request.args.get("kind") or "").strip()
+    if kind not in _TICK_KINDS:
+        return jsonify({"error": "kind must be 'setup' or 'checkin'"}), 400
+    try:
+        item_index = int(request.args.get("item_index", ""))
+    except ValueError:
+        return jsonify({"error": "item_index required"}), 400
+    clear_tick(event_id, item_index, kind)
     return jsonify({"success": True})
 
 

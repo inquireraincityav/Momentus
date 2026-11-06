@@ -66,6 +66,24 @@ def init_db():
             PRIMARY KEY (note_id, author, emoji)
         )
     ''')
+    # Typed per-event ticks (Phase 1 accountability model).
+    # One row per (event, item_index, kind). "kind" is 'setup' (evening crew
+    # pre-sets the room for tomorrow) or 'checkin' (day-of crew walks up to
+    # the client to confirm AV is good). A tick is append-only in spirit — the
+    # row is replaced on re-tap, which gives the same semantics as last-write-wins
+    # for offline sync. 'item_index' = -1 is reserved for the whole-event tick
+    # (the "entire event done" row, when the crew doesn't itemize).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS event_ticks (
+            event_id   INTEGER NOT NULL,
+            item_index INTEGER NOT NULL,
+            kind       TEXT    NOT NULL,
+            initials   TEXT    NOT NULL DEFAULT '',
+            ticked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (event_id, item_index, kind)
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_event_ticks_event ON event_ticks(event_id)')
     # Small key/value table for one-time bookkeeping (e.g. migration flags).
     conn.execute('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)')
     _migrate(conn)
@@ -349,12 +367,15 @@ def get_events(start: str = None, end: str = None) -> list[dict]:
     note_counts = dict(conn.execute(
         'SELECT event_id, COUNT(*) FROM notes GROUP BY event_id'
     ).fetchall())
+    event_ids = [row['id'] for row in rows]
+    ticks = _get_ticks(conn, event_ids)
     conn.close()
 
     result = []
     for row in rows:
         e = _decode_event(row)
         e['note_count'] = note_counts.get(e['id'], 0)
+        e['ticks'] = ticks.get(e['id'], [])
         result.append(e)
     return result
 
@@ -362,8 +383,14 @@ def get_events(start: str = None, end: str = None) -> list[dict]:
 def get_event_by_id(event_id: int) -> dict | None:
     conn = get_connection()
     row = conn.execute('SELECT * FROM events WHERE id = ?', (event_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    ticks = _get_ticks(conn, [event_id]).get(event_id, [])
     conn.close()
-    return _decode_event(row) if row else None
+    e = _decode_event(row)
+    e['ticks'] = ticks
+    return e
 
 
 def delete_event(event_id: int):
@@ -397,6 +424,89 @@ def delete_events(event_ids: list[int]) -> tuple[int, list[str]]:
     conn.commit()
     conn.close()
     return count, images
+
+
+# ── Typed ticks (Phase 1) ─────────────────────────────────────────────────────
+
+_TICK_KINDS = ("setup", "checkin")
+
+
+def _get_ticks(conn, event_ids):
+    """Fetch every tick for the given event_ids, grouped by event_id."""
+    if not event_ids:
+        return {}
+    placeholders = ",".join("?" * len(event_ids))
+    rows = conn.execute(
+        f"SELECT event_id, item_index, kind, initials, ticked_at "
+        f"FROM event_ticks WHERE event_id IN ({placeholders})",
+        list(event_ids),
+    ).fetchall()
+    out: dict[int, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["event_id"], []).append({
+            "item_index": r["item_index"],
+            "kind":       r["kind"],
+            "initials":   r["initials"],
+            "ticked_at":  r["ticked_at"],
+        })
+    return out
+
+
+def set_tick(event_id: int, item_index: int, kind: str,
+             initials: str, ticked_at: str | None = None) -> bool:
+    """Record (or re-record) one typed tick.
+
+    kind is 'setup' or 'checkin'. item_index is the 0-based index of the setup
+    item being ticked, or -1 for a whole-event tick. ticked_at is accepted from
+    the client so offline-captured timestamps round-trip accurately; omit it to
+    stamp server-side.
+    """
+    if kind not in _TICK_KINDS:
+        return False
+    initials = (initials or "").strip()[:8]
+    conn = get_connection()
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if not exists:
+            return False
+        if ticked_at:
+            conn.execute(
+                "INSERT INTO event_ticks (event_id, item_index, kind, initials, ticked_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(event_id, item_index, kind) DO UPDATE SET "
+                "initials=excluded.initials, ticked_at=excluded.ticked_at",
+                (event_id, int(item_index), kind, initials, ticked_at),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO event_ticks (event_id, item_index, kind, initials) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(event_id, item_index, kind) DO UPDATE SET "
+                "initials=excluded.initials, ticked_at=CURRENT_TIMESTAMP",
+                (event_id, int(item_index), kind, initials),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return True
+
+
+def clear_tick(event_id: int, item_index: int, kind: str) -> bool:
+    """Remove one typed tick."""
+    if kind not in _TICK_KINDS:
+        return False
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM event_ticks WHERE event_id=? AND item_index=? AND kind=?",
+            (event_id, int(item_index), kind),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 def set_event_progress(event_id: int, checked_items=None, assistant_note=None,

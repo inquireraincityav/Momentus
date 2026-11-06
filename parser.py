@@ -14,17 +14,33 @@ import re
 
 import pdfplumber
 
+# ── Campus / venue headers the PDFs carry at the top of each page. Discarded
+# from the parse stream the same way the column headers are. The default list
+# covers every SFU campus the reports are run against; set VENUE_HEADERS (comma
+# separated) to extend or replace it for a non-SFU deployment.
+_DEFAULT_VENUE_HEADERS = (
+    "Burnaby Campus", "Vancouver Campus", "Surrey Campus",
+    "Harbour Centre", "Wosk Conference Centre", "Segal Building",
+)
+_VENUE_HEADERS = tuple(
+    h.strip() for h in (os.environ.get("VENUE_HEADERS") or
+                        ",".join(_DEFAULT_VENUE_HEADERS)).split(",") if h.strip()
+)
+_VENUE_HEADER_ALT = "|".join(re.escape(h) for h in _VENUE_HEADERS)
+
 # ── Lines to discard (prefix-match — no trailing $ so partial lines are caught) ─
 _SKIP_RE = re.compile(
     r'^(?:'
     r'\w{3}-\d{2}-\d{2}\s+\d{2}:\d{2}'   # timestamp  "Apr-29-26 13:58"
-    r'|Daily Resources'                    # "Daily Resources by Setup Time …"
-    r'|April \d+, \d{4} -'                # date-range "April 30, 2026 - May …"
-    r'|Burnaby Campus'
+    r'|Daily Resources'                    # "Daily Resources by Setup Time …" / "… by Pickup Time"
+    r'|(?:January|February|March|April|May|June|July|August|September|October|November|December) '
+    r'\d+, \d{4}(?:\s*-|$)'               # date-range "April 30, 2026 - May …" or a bare per-page report header "November 5, 2026"
+    + (r'|' + _VENUE_HEADER_ALT if _VENUE_HEADER_ALT else "") +
     r'|Audio/Visual Services'
     r'|Event Services'
     r'|Attend\s*/'
-    r'|Start\s+End\s+Space'               # column header row
+    r'|Start\s+End\s+Space'               # column header row — setup-time layout
+    r'|End\s+Start\s+Space'               # column header row — pickup-time layout
     r'|[a-f0-9]{8}-[a-f0-9]{4}.*\.rpt'   # UUID footer
     r'|Page \d+ of \d+'
     r')'
@@ -113,7 +129,21 @@ def _is_boilerplate(line: str) -> bool:
     return any(line.startswith(s) for s in _BOILERPLATE_STARTS)
 
 
-def _parse_lines(lines: list[str]) -> list[dict]:
+# Vertical "PICKUP" watermark on the Pickup Time report leaks into pdfplumber
+# output as single-letter standalone lines (one of P, I, C, K, U) and as a
+# trailing " <letter>" on otherwise well-formed header lines (e.g.
+# "Thursday, November 5, 2026 U"). We strip the trailing form up front and
+# discard the standalone form during the main parse loop.
+_PICKUP_WATERMARK_RE      = re.compile(r'^[PICKU]$')
+_PICKUP_WATERMARK_TAIL_RE = re.compile(r'\s[PICKU]$')
+
+
+def _parse_lines(lines: list[str], pickup_order: bool = False) -> list[dict]:
+    """Parse Daily Resources report lines into event dicts.
+
+    pickup_order=False: the Setup Time report — event line is 'start  end  room …'
+    pickup_order=True : the Pickup Time report — event line is 'end  start  room …'
+    """
     events:       list[dict] = []
     current_date: str | None = None
     current_ev:   dict | None = None
@@ -127,6 +157,12 @@ def _parse_lines(lines: list[str]) -> list[dict]:
         line = raw.strip()
         if not line:
             continue
+        if pickup_order:
+            # Drop the standalone watermark-letter line; strip the trailing
+            # " U" / " P" / etc. that got glued onto real header lines.
+            if _PICKUP_WATERMARK_RE.match(line):
+                continue
+            line = _PICKUP_WATERMARK_TAIL_RE.sub('', line)
         if _SKIP_RE.match(line):
             continue
 
@@ -148,10 +184,13 @@ def _parse_lines(lines: list[str]) -> list[dict]:
             _save()
             in_note = False
             room, service, attendance = _split_room_service(em.group(3))
+            # Setup Time: group1=start, group2=end. Pickup Time: group1=end, group2=start.
+            g1, g2 = _pad_time(em.group(1)), _pad_time(em.group(2))
+            start_t, end_t = (g2, g1) if pickup_order else (g1, g2)
             current_ev = {
                 'date':           current_date,
-                'start_time':     _pad_time(em.group(1)),
-                'end_time':       _pad_time(em.group(2)),
+                'start_time':     start_t,
+                'end_time':       end_t,
                 'room':           room,
                 'service_type':   service,
                 'attendance':     attendance,
@@ -229,6 +268,12 @@ def _parse_lines(lines: list[str]) -> list[dict]:
 
 
 # ── Format 2: Services by Function Date ───────────────────────────────────────
+
+def _is_pickup_time_format(text: str) -> bool:
+    """Detect the Pickup Time report by its title or its reversed column header."""
+    return ('Daily Resources by Pickup Time' in text
+            or re.search(r'^End\s+Start\s+Space', text, re.MULTILINE) is not None)
+
 
 def _is_services_by_function_format(text: str) -> bool:
     """Detect the second PDF format by its title or its event-header line."""
@@ -813,6 +858,12 @@ def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     elif _is_services_by_function_format(full_text):
         events = _parse_services_by_function_date(pages)
         fmt = 'Services by Function Date'
+    elif _is_pickup_time_format(full_text):
+        all_lines: list[str] = []
+        for page_text in pages:
+            all_lines.extend(page_text.splitlines())
+        events = _parse_lines(all_lines, pickup_order=True)
+        fmt = 'Daily Resources by Pickup Time'
     else:
         all_lines: list[str] = []
         for page_text in pages:
