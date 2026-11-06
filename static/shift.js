@@ -106,6 +106,8 @@
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'tick-btn ' + (kind === 'checkin' ? 'checkin' : 'setup');
+    btn.dataset.itemIndex = itemIndex;
+    btn.dataset.kind = kind;
     paintBtn(btn, ev, itemIndex, kind);
     btn.addEventListener('click', () => onTickTap(btn, ev, itemIndex, kind));
     return btn;
@@ -116,11 +118,26 @@
     const label = kind === 'setup' ? 'Setup' : 'Check-in';
     if (t) {
       btn.classList.add('on');
-      btn.innerHTML = `${label} <span class="initials-pill">${escape(t.initials || '•')}</span>`;
+      const when = fmtLocalHM(t.ticked_at);
+      const pill = escape(t.initials || '•') + (when ? ' ' + when : '');
+      btn.innerHTML = `${label} <span class="initials-pill">${pill}</span>`;
+      btn.title = `${label} by ${t.initials || '—'} at ${when || t.ticked_at || ''}`;
     } else {
       btn.classList.remove('on');
       btn.textContent = label;
+      btn.title = '';
     }
+  }
+
+  // Server stores ticked_at as UTC "YYYY-MM-DD HH:MM:SS". Show it in the
+  // viewer's local time as HH:MM so the pill stays short.
+  function fmtLocalHM(utcStr) {
+    if (!utcStr) return '';
+    const m = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/.exec(utcStr);
+    if (!m) return '';
+    const d = new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]));
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   function onTickTap(btn, ev, itemIndex, kind) {
@@ -283,21 +300,22 @@
     return d.toISOString().slice(0, 10);
   }
 
+  function fetchDay() {
+    return fetch(`/api/events?start=${DATE}&end=${nextDay(DATE)}`)
+      .then(r => r.json())
+      .then(raw => raw.map(fc => Object.assign(
+        { id: parseInt(fc.id, 10) }, fc.extendedProps || {},
+        { start_time: fc.start ? fc.start.slice(11, 16) : '',
+          end_time:   fc.end   ? fc.end.slice(11, 16)   : '',
+          service_type: fc.extendedProps && fc.extendedProps.service_type || '',
+          setup_items:  fc.extendedProps && fc.extendedProps.setup_items || [],
+          event_name: (fc.title || '').split(' – ')[0] || fc.title || '',
+        }
+      )));
+  }
+
   async function loadDay() {
-    // FullCalendar's /api/events treats `end` as exclusive — pass the next day
-    // so the current day's rows are included.
-    const r = await fetch(`/api/events?start=${DATE}&end=${nextDay(DATE)}`);
-    const raw = await r.json();
-    // Flatten FullCalendar envelope → event dict
-    state.events = raw.map(fc => Object.assign(
-      { id: parseInt(fc.id, 10) }, fc.extendedProps || {},
-      { start_time: fc.start ? fc.start.slice(11, 16) : '',
-        end_time: fc.end ? fc.end.slice(11, 16) : '',
-        service_type: fc.extendedProps && fc.extendedProps.service_type || '',
-        setup_items: fc.extendedProps && fc.extendedProps.setup_items || [],
-        event_name: (fc.title || '').split(' – ')[0] || fc.title || '',
-      }
-    ));
+    state.events = await fetchDay();
     const host = document.getElementById('events');
     host.innerHTML = '';
     if (state.events.length === 0) {
@@ -309,7 +327,81 @@
     flushOutbox();
   }
 
+  // Poll every 20s so another tech's ticks appear here without a manual reload.
+  // We re-paint only the tick buttons, not the whole card, so scroll position
+  // and any half-typed initials prompt are preserved. The local outbox wins on
+  // conflict: if a tick we just queued hasn't reached the server yet, we don't
+  // let the stale server copy wipe it from the UI.
+  async function pollAndMerge() {
+    if (!navigator.onLine) return;
+    let fresh;
+    try { fresh = await fetchDay(); } catch (_) { return; }
+    const byId = {};
+    fresh.forEach(e => { byId[e.id] = e; });
+    state.events.forEach(ev => {
+      const f = byId[ev.id];
+      if (!f) return;
+      const pending = pendingTicksFor(ev.id);
+      ev.ticks = mergeTicks(f.ticks || [], pending);
+      repaintEventTicks(ev);
+    });
+    updateBanner();
+  }
+
+  // Pull ticks for one event from the outbox so pending POSTs don't get
+  // overwritten by a server copy that hasn't seen them yet.
+  function pendingTicksFor(eventId) {
+    const out = { sets: [], clears: [] };
+    const postPrefix = `/api/events/${eventId}/tick`;
+    const delPrefix  = `/api/events/${eventId}/tick?`;
+    state.outbox.forEach(req => {
+      if (req.method === 'POST' && req.url === postPrefix && req.body) {
+        out.sets.push(req.body);
+      } else if (req.method === 'DELETE' && req.url.startsWith(delPrefix)) {
+        const params = new URLSearchParams(req.url.split('?')[1] || '');
+        out.clears.push({
+          item_index: parseInt(params.get('item_index'), 10),
+          kind:       params.get('kind'),
+        });
+      }
+    });
+    return out;
+  }
+
+  function mergeTicks(serverTicks, pending) {
+    const result = serverTicks.slice();
+    pending.clears.forEach(c => {
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i].item_index === c.item_index && result[i].kind === c.kind) {
+          result.splice(i, 1);
+        }
+      }
+    });
+    pending.sets.forEach(s => {
+      const idx = result.findIndex(t => t.item_index === s.item_index && t.kind === s.kind);
+      if (idx >= 0) result[idx] = s; else result.push(s);
+    });
+    return result;
+  }
+
+  function repaintEventTicks(ev) {
+    const card = document.querySelector(`.ev[data-event-id="${ev.id}"]`);
+    if (!card) return;
+    const btns = card.querySelectorAll('.tick-btn');
+    btns.forEach(btn => {
+      const idx = parseInt(btn.dataset.itemIndex, 10);
+      const kind = btn.dataset.kind;
+      paintBtn(btn, ev, idx, kind);
+    });
+    maybeMarkAllDone(card, ev);
+  }
+
   renderIdentity();
   updateOfflineBar();
   loadDay();
+  setInterval(pollAndMerge, 20000);
+  // Also refresh on tab focus — most "I just opened the app" cases.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') pollAndMerge();
+  });
 })();

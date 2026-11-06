@@ -5,11 +5,11 @@
   "scope": "/",
   "display": "standalone",
   "orientation": "any",
-  "theme_color": "#0b1f3a",
+  "theme_color": "#A6192E",
   "background_color": "#ffffff",
   "icons": [
     {
-      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' rx='28' fill='%230b1f3a'/><text x='50%25' y='58%25' font-family='system-ui' font-size='96' font-weight='700' text-anchor='middle' fill='white'>H</text></svg>",
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' rx='28' fill='%23A6192E'/><text x='50%25' y='58%25' font-family='system-ui' font-size='96' font-weight='700' text-anchor='middle' fill='white'>H</text></svg>",
       "sizes": "192x192",
       "type": "image/svg+xml",
       "purpose": "any"
