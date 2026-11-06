@@ -165,9 +165,9 @@
         <!-- Drop zone -->
         <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
           <i class="bi bi-file-earmark-arrow-up drop-icon"></i>
-          <p class="mb-1 fw-semibold">Drop PDF here or click to browse</p>
-          <p class="text-muted small mb-0">Supports MECS "Daily Resources by Space", "by Setup Time" &amp; "Services by Function Date" reports</p>
-          <input type="file" id="file-input" accept=".pdf" class="d-none">
+          <p class="mb-1 fw-semibold">Drop PDFs here or click to browse</p>
+          <p class="text-muted small mb-0">Drop all 4 reports at once — Setup Time, Pickup Time, Space, Services by Function Date. Each PDF is detected and parsed independently.</p>
+          <input type="file" id="file-input" accept=".pdf" class="d-none" multiple>
         </div>
 
         <!-- Progress indicator (hidden until upload starts) -->

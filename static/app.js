@@ -1476,12 +1476,13 @@ function initDropZone() {
   newZone.addEventListener('drop', e => {
     e.preventDefault();
     newZone.classList.remove('drag-over');
-    const file = e.dataTransfer.files[0];
-    if (file) doUpload(file);
+    const files = Array.from(e.dataTransfer.files).filter(f => /\.pdf$/i.test(f.name));
+    if (files.length) doUploadMany(files);
   });
 
   newInput.addEventListener('change', () => {
-    if (newInput.files[0]) doUpload(newInput.files[0]);
+    const files = Array.from(newInput.files).filter(f => /\.pdf$/i.test(f.name));
+    if (files.length) doUploadMany(files);
   });
 
   // Reset state every time modal opens
@@ -1495,55 +1496,114 @@ function resetUploadUI() {
   if (zone) zone.classList.remove('d-none');
 }
 
-async function doUpload(file) {
-  const zone     = document.getElementById('drop-zone');
-  const progress = document.getElementById('upload-progress');
-  const alert    = document.getElementById('upload-alert');
-
-  zone.classList.add('d-none');
-  progress.classList.remove('d-none');
-  alert.innerHTML = '';
-
+// Upload one PDF. Returns a per-file result object the batch summarizer
+// combines into a single alert. Never throws — errors are captured on the
+// returned object so one bad PDF doesn't abort the rest of the batch.
+async function doUploadOne(file) {
   const formData = new FormData();
   formData.append('file', file);
-
   try {
-    const res  = await fetch('/upload', { method: 'POST', body: formData });
-
+    const res = await fetch('/upload', { method: 'POST', body: formData });
     // A server/proxy error (413, 502, 504…) often returns an HTML page, not
-    // JSON, so check the status before parsing — otherwise res.json() throws a
-    // cryptic "unexpected character" error that hides the real cause. When the
-    // app itself returns a JSON error (e.g. a 500 "Parsing failed: …"), surface
-    // that specific message rather than a generic one.
+    // JSON — read the server's own JSON error when present, or synthesize a
+    // tailored message for the status code, so techs see the real cause.
     if (!res.ok) {
       let serverMsg = '';
       try { serverMsg = (JSON.parse(await res.text()) || {}).error || ''; } catch (_) {}
       const msg = serverMsg
         ? serverMsg
-        : res.status === 413
-        ? 'This file is too large for the server to accept. Ask an admin to raise the upload size limit (nginx client_max_body_size).'
+        : res.status === 413 ? 'This file is too large for the server to accept.'
         : (res.status === 502 || res.status === 504)
-        ? 'The server timed out processing this report — it may be very large. Ask an admin to raise the request timeout (gunicorn --timeout / nginx proxy_read_timeout).'
-        : `Server error (${res.status}). Please try again, or contact an admin if it persists.`;
-      alert.innerHTML = errorAlert(msg);
-      return;
+            ? 'The server timed out processing this report.'
+        : `Server error (${res.status}).`;
+      return { name: file.name, error: msg };
     }
-
     const data = await res.json();
-
-    if (data.no_changes) {
-      alert.innerHTML = noChangesAlert(data.message);
-    } else {
-      alert.innerHTML = uploadSummaryAlert(data);
-      calendar.refetchEvents();
-      refreshBadge();
-    }
+    return Object.assign({ name: file.name }, data);
   } catch (err) {
-    alert.innerHTML = errorAlert(`Network error: ${err.message}`);
-  } finally {
-    progress.classList.add('d-none');
-    zone.classList.remove('d-none');
+    return { name: file.name, error: `Network error: ${err.message}` };
   }
+}
+
+async function doUploadMany(files) {
+  const zone     = document.getElementById('drop-zone');
+  const progress = document.getElementById('upload-progress');
+  const alert    = document.getElementById('upload-alert');
+  const label    = progress.querySelector('p.fw-semibold');
+
+  zone.classList.add('d-none');
+  progress.classList.remove('d-none');
+  alert.innerHTML = '';
+
+  // Sequential — SQLite + pdfplumber are single-writer bound, so running in
+  // parallel just adds contention without going faster.
+  const results = [];
+  for (let i = 0; i < files.length; i++) {
+    if (label) {
+      label.textContent = files.length === 1
+        ? 'Extracting events …'
+        : `Extracting events (${i + 1} of ${files.length}: ${files[i].name}) …`;
+    }
+    results.push(await doUploadOne(files[i]));
+  }
+
+  alert.innerHTML = batchSummaryAlert(results);
+  calendar.refetchEvents();
+  refreshBadge();
+  progress.classList.add('d-none');
+  zone.classList.remove('d-none');
+  if (label) label.textContent = 'Extracting events …';
+}
+
+// Combine per-file results into one alert so dropping four PDFs reads as one
+// outcome, not four stacked banners.
+function batchSummaryAlert(results) {
+  const ok       = results.filter(r => !r.error);
+  const bad      = results.filter(r =>  r.error);
+  const totals   = ok.reduce((t, r) => ({
+    new:       t.new       + (r.new       || 0),
+    updated:   t.updated   + (r.updated   || 0),
+    cancelled: t.cancelled + (r.cancelled || 0),
+    skipped:   t.skipped   + (r.skipped   || 0),
+  }), { new: 0, updated: 0, cancelled: 0, skipped: 0 });
+
+  const fileLines = results.map(r => {
+    if (r.error) {
+      return `<li class="text-danger"><i class="bi bi-x-octagon-fill me-1"></i><strong>${escHtml(r.name)}</strong> — ${escHtml(r.error)}</li>`;
+    }
+    if (r.no_changes) {
+      return `<li class="text-muted"><i class="bi bi-check2-all me-1"></i><strong>${escHtml(r.name)}</strong> — no changes</li>`;
+    }
+    const bits = [];
+    if (r.new)       bits.push(`${r.new} new`);
+    if (r.updated)   bits.push(`${r.updated} updated`);
+    if (r.cancelled) bits.push(`${r.cancelled} cancelled`);
+    if (r.skipped)   bits.push(`<span class="text-muted">${r.skipped} unchanged</span>`);
+    return `<li><i class="bi bi-file-earmark-pdf me-1"></i><strong>${escHtml(r.name)}</strong> — ${bits.join(', ') || 'no changes'}</li>`;
+  }).join('');
+
+  const cls = bad.length
+    ? (ok.length ? 'alert-warning' : 'alert-danger')
+    : (totals.cancelled ? 'alert-warning' : totals.updated ? 'alert-info' : 'alert-success');
+  const icon = bad.length
+    ? 'bi-exclamation-triangle-fill'
+    : (totals.cancelled ? 'bi-x-octagon-fill' : totals.updated ? 'bi-arrow-repeat' : 'bi-check-circle-fill');
+
+  const totalRows = [];
+  if (totals.new)       totalRows.push(`<strong>${totals.new}</strong> new event${totals.new !== 1 ? 's' : ''}`);
+  if (totals.updated)   totalRows.push(`<strong>${totals.updated}</strong> updated`);
+  if (totals.cancelled) totalRows.push(`<strong>${totals.cancelled}</strong> cancelled`);
+  const totalLine = totalRows.length
+    ? `<div class="mb-2">${results.length} PDF${results.length !== 1 ? 's' : ''} processed — ${totalRows.join(' · ')}</div>`
+    : (bad.length ? '' : `<div class="mb-2">${results.length} PDF${results.length !== 1 ? 's' : ''} processed — no changes</div>`);
+
+  return `<div class="alert ${cls} d-flex align-items-start gap-2 mb-0">
+    <i class="bi ${icon} flex-shrink-0 mt-1"></i>
+    <div class="flex-grow-1">
+      ${totalLine}
+      <ul class="mb-0 ps-3">${fileLines}</ul>
+    </div>
+  </div>`;
 }
 
 // ── Global actions ────────────────────────────────────────────────────────
