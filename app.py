@@ -31,7 +31,7 @@ from database import (add_note, clear_tick, count_events, count_events_in_range,
                       get_unread_notes, init_db, save_events,
                       set_event_hidden, set_events_hidden, set_event_progress,
                       set_tick, toggle_reaction, update_note)
-from parser import extract_and_parse_pdf
+from parser import UnsupportedReportError, extract_and_parse_pdf
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "uploads"
@@ -271,6 +271,10 @@ def upload():
             "cancelled": cancelled_count,
             "skipped":   skipped_count,
         })
+    except UnsupportedReportError as e:
+        # Known MECS report type we don't parse yet — tell the tech exactly
+        # what and why, not a generic "parsing failed".
+        return jsonify({"error": str(e), "unsupported_report": True}), 400
     except Exception:
         app.logger.exception("Parsing %s failed", dest)
         return jsonify({"error": "Parsing failed. Check that this is a MECS events PDF."}), 500

@@ -844,13 +844,45 @@ def _dedupe_events(events: list[dict]) -> list[dict]:
     return [merged[k] for k in order]
 
 
+class UnsupportedReportError(Exception):
+    """Raised when a PDF is recognizable as a MECS report but of a type the
+    parser can't ingest yet. Carries a human-facing message the upload route
+    surfaces verbatim so techs see exactly why their drop had no effect."""
+
+
+# Report formats the parser DOES NOT yet know how to extract events from.
+# Detecting them explicitly — rather than letting them silently fall through
+# to the Setup Time default — is what keeps "upload did nothing" from looking
+# like a server bug. The first match wins; each entry is (title-substring, msg).
+_UNSUPPORTED_REPORT_TITLES = (
+    ("Event Bookings by Venue",
+     "'Event Bookings by Venue' is not supported yet. Supported reports: "
+     "Daily Resources by Setup Time, by Pickup Time, by Space, and Services "
+     "by Function Date."),
+    ("Room Set Work Orders",
+     "'Room Set Work Orders' is not supported yet. Supported reports: "
+     "Daily Resources by Setup Time, by Pickup Time, by Space, and Services "
+     "by Function Date."),
+)
+
+
 def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     """
     Extract text from every page and parse events with regex. Auto-detects which
-    of the three MECS PDF formats is in use. No API key required.
+    MECS PDF format is in use. Raises UnsupportedReportError when the PDF is a
+    known MECS report we have no parser for yet; the upload route surfaces the
+    message to the tech so an unrecognized drop is obviously-not-silently a
+    no-op.
     """
     pages = extract_pages(pdf_path)
     full_text = '\n'.join(pages)
+
+    # Refuse known-but-unsupported reports with a clear message before the
+    # format cascade below, so they don't fall through to the Setup Time
+    # default and return "no changes" from an empty parse.
+    for needle, msg in _UNSUPPORTED_REPORT_TITLES:
+        if needle in full_text:
+            raise UnsupportedReportError(msg)
 
     if _is_by_space_format(full_text):
         events = _parse_by_space_pdf(pdf_path)
@@ -864,12 +896,20 @@ def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
             all_lines.extend(page_text.splitlines())
         events = _parse_lines(all_lines, pickup_order=True)
         fmt = 'Daily Resources by Pickup Time'
-    else:
+    elif 'Daily Resources by Setup Time' in full_text:
         all_lines: list[str] = []
         for page_text in pages:
             all_lines.extend(page_text.splitlines())
         events = _parse_lines(all_lines)
         fmt = 'Daily Resources by Setup Time'
+    else:
+        # Not one of the four known formats. Returning an empty list would read
+        # as "no changes" in the UI, which is worse than failing loudly.
+        raise UnsupportedReportError(
+            "This PDF doesn't look like a MECS report the parser recognizes. "
+            "Supported reports: Daily Resources by Setup Time, by Pickup Time, "
+            "by Space, and Services by Function Date."
+        )
 
     events = _dedupe_events(events)
 
