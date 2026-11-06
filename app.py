@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import (Flask, Response, jsonify, redirect, render_template, request,
+from flask import (Flask, Response, jsonify, render_template, request,
                    send_from_directory)
 from werkzeug.utils import secure_filename
 
@@ -84,14 +84,6 @@ def _security_headers(resp: Response) -> Response:
 
 @app.route("/")
 def index():
-    # Root now lands on the shift view — that's where the iPads live. The old
-    # FullCalendar page is still reachable at /calendar for the upload flow,
-    # analytics and comments.
-    return redirect("/today", code=302)
-
-
-@app.route("/calendar")
-def calendar_page():
     return render_template("index.html")
 
 
