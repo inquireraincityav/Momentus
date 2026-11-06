@@ -466,14 +466,24 @@ document.addEventListener('DOMContentLoaded', () => {
   calendar.render();
   refreshBadge();
 
-  // Background refresh so a comment someone else adds shows up as a live
-  // notification (unseen badge / ★ flag) without needing a manual reload.
-  // Skipped while an event's notes are already open — that thread has its
-  // own 4s poll — and while the tab is in the background.
+  // Background refresh so a comment or tick someone else adds shows up without
+  // a manual reload. Shortened from 60s → 20s now that typed ticks carry a
+  // wall-clock time and a tech has to see a peer's tick land to know it's
+  // done. Still skipped when the tab is in the background.
+  // When a modal is open, the full refetch would wipe the modal state, so a
+  // separate per-event tick poll runs below without disturbing the rest.
   setInterval(() => {
     if (document.hidden || _currentEventId != null) return;
     calendar.refetchEvents();
-  }, 60000);
+  }, 20000);
+
+  // Open-modal tick refresh: every 20s pull just the current event's ticks and
+  // re-paint the inline stamps. No modal state is otherwise touched, so note
+  // threads mid-reply and the checked-box visual stay as they are.
+  setInterval(refreshOpenModalTicks, 20000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && _currentEventId != null) refreshOpenModalTicks();
+  });
 
   // Swap the calendar toolbar for a compact one when crossing the mobile
   // breakpoint. Driven off window resize so it also fires on orientation change.
@@ -1068,9 +1078,16 @@ function showEventModal(event) {
     ? (fmtTime(event.start) + (event.end ? ` – ${fmtTime(event.end)}` : ''))
     : '—';
 
-  // Setup items — each is a checkbox an assistant ticks off as completed
+  // Setup items — each is a checkbox an assistant ticks off as completed.
+  // A typed tick ({initials, ticked_at}) rendered next to the item answers
+  // "who checked this and when" at a glance; the full timestamp is in the
+  // pill's title attribute for hover/long-press.
   const items = props.setup_items || [];
   const checkedSet = new Set(props.checked_items || []);
+  const setupTicks = {};
+  (props.ticks || []).forEach(t => {
+    if (t.kind === 'setup' && t.item_index >= 0) setupTicks[t.item_index] = t;
+  });
   const doneCount = items.reduce((n, _, i) => n + (checkedSet.has(i) ? 1 : 0), 0);
   const setupComplete = items.length > 0 && doneCount >= items.length;
   const setupHtml = items.length
@@ -1087,6 +1104,7 @@ function showEventModal(event) {
                  <span class="setup-qty">${escHtml(it.qty)}</span>
                  <span class="setup-item-name">${boldAfterNote(it.item)}</span>
                </label>
+               <span class="tick-stamp" data-idx="${i}">${renderTickStamp(setupTicks[i])}</span>
              </li>`).join('')}
          </ul>
        </div>`
@@ -1255,6 +1273,13 @@ function wireProgressControls(id) {
   body.querySelectorAll('.item-check').forEach(cb => {
     cb.addEventListener('change', () => {
       cb.closest('li').classList.toggle('completed', cb.checked);
+      // First tick of a session with no name set: prompt once. If the user
+      // dismisses, the flat checked_items still saves but the typed tick is
+      // skipped (we don't want to keep nagging on every item).
+      if (cb.checked && !getUsername()) App.changeName();
+      const name = getUsername();
+      paintTickStamp(+cb.dataset.idx, cb.checked, name);
+      postTick(id, +cb.dataset.idx, cb.checked);
       saveProgress(id);
     });
   });
@@ -1295,6 +1320,103 @@ async function postProgress(id, body) {
       body:    JSON.stringify(body),
     });
   } catch (_) {}
+}
+
+// Render the per-item pill shown next to a checked setup item: "JD · 14:32".
+// Returns '' when the item has no typed tick yet.
+function renderTickStamp(tick) {
+  if (!tick) return '';
+  const initials = (tick.initials || '•');
+  const when = fmtLocalHMUTC(tick.ticked_at);
+  const title = `Setup by ${initials} at ${when || tick.ticked_at || ''}`;
+  return `<span class="initials-pill" title="${escHtml(title)}">${escHtml(initials)}${when ? ' · ' + when : ''}</span>`;
+}
+
+// Server stores ticked_at as UTC "YYYY-MM-DD HH:MM:SS". Show it in the viewer's
+// local time as HH:MM so the pill stays short.
+function fmtLocalHMUTC(utcStr) {
+  if (!utcStr) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/.exec(utcStr);
+  if (!m) return '';
+  const d = new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]));
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Post a typed tick (kind='setup') or clear it, carrying the current user's
+// initials. The legacy checked_items flat list is still written by
+// saveProgress(); this gives us the "who and when" the flat list can't carry.
+// Initials are derived from the user's signed-in name: first letter of each
+// word, up to 4 characters.
+function initialsFor(name) {
+  return (name || '')
+    .split(/\s+/).filter(Boolean).map(w => w[0]).join('')
+    .toUpperCase().slice(0, 4) || 'XX';
+}
+
+async function postTick(eventId, itemIndex, checked) {
+  const name = getUsername();
+  if (!name) return; // no identity → skip the typed tick; checked_items still records it
+  if (checked) {
+    try {
+      await fetch(`/api/events/${eventId}/tick`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          item_index: itemIndex,
+          kind: 'setup',
+          initials: initialsFor(name),
+        }),
+      });
+    } catch (_) {}
+  } else {
+    try {
+      await fetch(`/api/events/${eventId}/tick?kind=setup&item_index=${itemIndex}`, {
+        method: 'DELETE',
+      });
+    } catch (_) {}
+  }
+}
+
+// Replace the inline stamp beside a ticked item without redrawing the modal.
+function paintTickStamp(itemIndex, checked, name) {
+  const span = document.querySelector(`.tick-stamp[data-idx="${itemIndex}"]`);
+  if (!span) return;
+  if (checked) {
+    const tick = {
+      initials:  initialsFor(name),
+      ticked_at: fmtServerUtcNow(),
+    };
+    span.innerHTML = renderTickStamp(tick);
+  } else {
+    span.innerHTML = '';
+  }
+}
+
+// Fetch just the current event's ticks and re-paint the inline per-item
+// stamps. Everything else about the open modal is left alone, so a note the
+// user is typing or a half-expanded section stays as-is.
+async function refreshOpenModalTicks() {
+  if (document.hidden || _currentEventId == null) return;
+  let ev;
+  try {
+    const r = await fetch(`/api/events/${_currentEventId}`, { cache: 'no-store' });
+    if (!r.ok) return;
+    ev = await r.json();
+  } catch (_) { return; }
+  const ticks = (ev.ticks || []).filter(t => t.kind === 'setup' && t.item_index >= 0);
+  const byIdx = {};
+  ticks.forEach(t => { byIdx[t.item_index] = t; });
+  document.querySelectorAll('.tick-stamp').forEach(span => {
+    const idx = +span.dataset.idx;
+    span.innerHTML = renderTickStamp(byIdx[idx]);
+  });
+}
+
+function fmtServerUtcNow() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
 async function saveProgress(id) {

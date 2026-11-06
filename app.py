@@ -370,6 +370,17 @@ def api_events():
     return jsonify(fc_events)
 
 
+@app.route("/api/events/<int:event_id>", methods=["GET"])
+def api_event_detail(event_id):
+    """Single-event read used by the calendar's open-modal tick poll so a peer's
+    tick appears while an event's modal is open, without refetching the whole
+    calendar (which would wipe the modal)."""
+    ev = get_event_by_id(event_id)
+    if not ev:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(ev)
+
+
 @app.route("/api/events/<int:event_id>", methods=["DELETE"])
 def api_delete_event(event_id):
     delete_event(event_id)
