@@ -808,6 +808,274 @@ def extract_pages(pdf_path: str) -> list[str]:
     return pages
 
 
+# ── Format 4: Event Bookings by Venue ─────────────────────────────────────────
+# This is the venue-grouped index: one row per booking, grouped by space, with
+# no setup items. Great for "what's happening in HC 1500 today" — the shift
+# crew uses it when they need a full view of every function (classes included,
+# not just the AV ones).
+
+_EB_VENUE_HEADER_RE = re.compile(
+    r'^(Harbour Centre|Wosk Conference Centre|Segal Building)(?:\s*\(Continued\))?$'
+)
+
+# Full row (new space on the left) and continuation row (same space as above).
+_EB_ROW_FULL_RE = re.compile(
+    r'^(?P<space>[A-Z][A-Za-z0-9 /-]*?)'
+    r'\s+(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})'
+    r'\s+#(?P<eid>\d+)\s+(?P<rest>.+)$'
+)
+_EB_ROW_CONT_RE = re.compile(
+    r'^(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})'
+    r'\s+#(?P<eid>\d+)\s+(?P<rest>.+)$'
+)
+
+# Known booking-status words, longest first so "Int Cont Rcv" matches before "Rcv".
+_EB_STATUSES = (
+    "Int Cont Rcv", "Contract Rcv", "Non-Credit", "Internal",
+    "Credit", "Invoiced", "Maint",
+)
+_EB_STATUS_RE = re.compile(
+    r'\s(' + '|'.join(re.escape(s) for s in _EB_STATUSES) + r')\s'
+)
+
+_EB_SKIP_RE = re.compile(
+    r'^(?:'
+    r'Event Bookings by Venue'
+    r'|by Space'
+    r'|Space Start - End Event'
+    r'|[a-f0-9]{8}-[a-f0-9]{4}.*\.rpt'
+    r'|Page \d+ of \d+'
+    r')'
+)
+
+
+def _is_event_bookings_format(text: str) -> bool:
+    return 'Event Bookings by Venue' in text
+
+
+def _eb_tail_split(rest: str) -> tuple[str, str, str, str]:
+    """Pull (event_name, status, it_support, attend) from the tail of a row.
+
+    rest looks like "1267 IS 350W D100 (24) Credit Jill 24" — the booking
+    status is one of a known list, so find its last occurrence (so a
+    status-looking word inside the event name doesn't confuse us), then split
+    around it.
+    """
+    # Find the LAST status occurrence so "Credit" inside an event name doesn't
+    # steal the split. Padded with spaces to avoid matching inside words.
+    padded = f' {rest} '
+    status = ''
+    status_end = -1
+    for m in _EB_STATUS_RE.finditer(padded):
+        status = m.group(1)
+        status_end = m.end()
+    if not status:
+        # No booking status found — give up on structured split, treat whole rest as name.
+        return rest.strip(), '', '', ''
+    name = padded[:status_end - len(status) - 2].strip()  # minus the trailing space and the status itself
+    tail = padded[status_end:].strip()
+    # tail is "IT_support attend", where IT_support is one word.
+    parts = tail.rsplit(None, 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return name, status, parts[0].strip(), parts[1]
+    return name, status, tail, ''
+
+
+def _parse_event_bookings_pdf(pages: list[str]) -> list[dict]:
+    """Parse the "Event Bookings by Venue" report.
+
+    One event dict per row. Multi-line event names are joined. No setup items —
+    this report is a bookings index, not a resources list.
+    """
+    events: list[dict] = []
+    current_date: str | None = None
+    current_space: str = ''
+    current_ev: dict | None = None
+
+    def _save():
+        if current_ev:
+            events.append(current_ev)
+
+    def _new_row(space, start, end, eid, rest):
+        name, status, mecs, attend = _eb_tail_split(rest)
+        return {
+            'date':           current_date,
+            'start_time':     _pad_time(start),
+            'end_time':       _pad_time(end),
+            'room':           space.strip(),
+            'service_type':   '',
+            'attendance':     attend,
+            'event_name':     name,
+            'event_number':   eid,
+            'onsite_contact': '',
+            'mecs_contact':   mecs,
+            'setup_items':    [],
+            'notes':          status,   # Carry booking status in notes so it is visible.
+            'department':     '',
+            'cancelled':      bool(_CANCEL_RE.search(name)),
+        }
+
+    for page_text in pages:
+        for raw in page_text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if _EB_SKIP_RE.match(line):
+                continue
+            if _EB_VENUE_HEADER_RE.match(line):
+                # Venue header is informative only; rows carry their own space.
+                continue
+            dm = _DATE_RE.match(line)
+            if dm:
+                _save()
+                current_ev = None
+                current_space = ''
+                month_name, day, year = dm.group(1), dm.group(2), dm.group(3)
+                current_date = f"{year}-{_MONTHS.get(month_name, 1):02d}-{int(day):02d}"
+                continue
+            if current_date is None:
+                continue
+
+            m = _EB_ROW_FULL_RE.match(line)
+            if m:
+                _save()
+                current_space = m.group('space').strip()
+                current_ev = _new_row(current_space, m.group('start'),
+                                      m.group('end'), m.group('eid'),
+                                      m.group('rest'))
+                continue
+
+            m = _EB_ROW_CONT_RE.match(line)
+            if m:
+                _save()
+                current_ev = _new_row(current_space or '', m.group('start'),
+                                      m.group('end'), m.group('eid'),
+                                      m.group('rest'))
+                continue
+
+            # Anything else is a continuation of the previous row's event name
+            # (name wrapped onto a second line) or a continuation of a two-line
+            # space name. If the current event's name is empty we're probably
+            # still in the space tail — append there instead.
+            if current_ev is not None:
+                if current_ev['event_name']:
+                    current_ev['event_name'] += ' ' + line
+                    if _CANCEL_RE.search(line):
+                        current_ev['cancelled'] = True
+                else:
+                    current_ev['room'] = (current_ev['room'] + ' ' + line).strip()
+
+    _save()
+    return events
+
+
+# ── Format 5: Room Set Work Orders ────────────────────────────────────────────
+# One work order per PDF page, laid out as a card with fixed labels. Each
+# order is a MECS furniture/setup task for a single space and time range.
+
+_RSWO_ORDER_RE = re.compile(r'^Order\s*#\s*(\d+)$')
+_RSWO_EVENT_RE = re.compile(r'^Event:\s*(\d+)\s*-\s*(.+)$')
+_RSWO_FUNC_RE  = re.compile(
+    r'^Function:\s*(?P<svc>.+?)\s*-\s*'
+    r'(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+'
+    r'(?P<month>\w+)\s+(?P<day>\d+),\s+(?P<year>\d{4})\s+'
+    r'(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})\s*$'
+)
+_RSWO_CONTACT_RE = re.compile(r'^MECS Contact:\s*(.+)$')
+
+_RSWO_SKIP_PREFIXES = (
+    'Room Set Work Order', 'Start After:', 'Complete By:',
+    'Room Set Diagram', 'Notes',
+)
+
+
+def _is_room_set_work_orders_format(text: str) -> bool:
+    return 'Room Set Work Order' in text
+
+
+def _parse_room_set_work_orders_pdf(pages: list[str]) -> list[dict]:
+    """Parse "Room Set Work Orders" — one order per page.
+
+    Emits one event dict per order; no setup items (the order is itself the
+    task). Notes between the "Notes" and "Room Set Diagram" labels are captured.
+    """
+    events: list[dict] = []
+    for page_text in pages:
+        lines = [raw.strip() for raw in page_text.splitlines() if raw.strip()]
+        ev: dict = {
+            'date': '', 'start_time': '', 'end_time': '',
+            'room': '', 'service_type': 'Room Set', 'attendance': '',
+            'event_name': '', 'event_number': '',
+            'onsite_contact': '', 'mecs_contact': '',
+            'setup_items': [], 'notes': '', 'department': '',
+            'cancelled': False,
+        }
+        in_notes = False
+        for i, line in enumerate(lines):
+            # Footer line
+            if _FD_FOOTER_RE.match(line):
+                break
+
+            m = _RSWO_ORDER_RE.match(line)
+            if m:
+                ev['event_number'] = m.group(1) if not ev['event_number'] else ev['event_number']
+                # Note: event_number is overwritten below by the Event: line's id, which is the real
+                # booking id. Order # is a different identifier (the work-order number) stored in notes.
+                ev['notes'] = (ev['notes'] + '\n' if ev['notes'] else '') + f"Order #{m.group(1)}"
+                in_notes = False
+                continue
+
+            m = _RSWO_EVENT_RE.match(line)
+            if m:
+                ev['event_number'] = m.group(1)
+                ev['event_name']   = m.group(2).strip()
+                ev['cancelled']    = bool(_CANCEL_RE.search(ev['event_name']))
+                in_notes = False
+                continue
+
+            m = _RSWO_FUNC_RE.match(line)
+            if m:
+                ev['service_type'] = m.group('svc').strip()
+                ev['date']         = f"{m.group('year')}-{_MONTHS.get(m.group('month'), 1):02d}-{int(m.group('day')):02d}"
+                ev['start_time']   = _pad_time(m.group('start'))
+                ev['end_time']     = _pad_time(m.group('end'))
+                in_notes = False
+                continue
+
+            m = _RSWO_CONTACT_RE.match(line)
+            if m:
+                ev['mecs_contact'] = m.group(1).strip()
+                in_notes = False
+                continue
+
+            if line == 'Notes':
+                in_notes = True
+                continue
+            if line == 'Room Set Diagram':
+                in_notes = False
+                continue
+
+            # The space line sits between "Order # …" and "Start After:" with
+            # no label — it's the first standalone line that isn't one of the
+            # known labeled lines. Capture it before we've seen Event:.
+            if not ev['room'] and not ev['event_name']:
+                if any(line.startswith(p) for p in _RSWO_SKIP_PREFIXES):
+                    continue
+                if line == 'Room Set Work Order':
+                    continue
+                ev['room'] = line
+                continue
+
+            if in_notes:
+                ev['notes'] = (ev['notes'] + '\n' if ev['notes'] else '') + line
+
+        # Only keep orders that got a real date + room; a cover page with just
+        # branding would otherwise produce an empty row.
+        if ev['date'] and ev['room']:
+            events.append(ev)
+    return events
+
+
 def _dedupe_events(events: list[dict]) -> list[dict]:
     """Merge events that share (date, start, end, room, service_type).
 
@@ -850,65 +1118,52 @@ class UnsupportedReportError(Exception):
     surfaces verbatim so techs see exactly why their drop had no effect."""
 
 
-# Report formats the parser DOES NOT yet know how to extract events from.
-# Detecting them explicitly — rather than letting them silently fall through
-# to the Setup Time default — is what keeps "upload did nothing" from looking
-# like a server bug. The first match wins; each entry is (title-substring, msg).
-_UNSUPPORTED_REPORT_TITLES = (
-    ("Event Bookings by Venue",
-     "'Event Bookings by Venue' is not supported yet. Supported reports: "
-     "Daily Resources by Setup Time, by Pickup Time, by Space, and Services "
-     "by Function Date."),
-    ("Room Set Work Orders",
-     "'Room Set Work Orders' is not supported yet. Supported reports: "
-     "Daily Resources by Setup Time, by Pickup Time, by Space, and Services "
-     "by Function Date."),
-)
-
-
 def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     """
     Extract text from every page and parse events with regex. Auto-detects which
-    MECS PDF format is in use. Raises UnsupportedReportError when the PDF is a
-    known MECS report we have no parser for yet; the upload route surfaces the
-    message to the tech so an unrecognized drop is obviously-not-silently a
-    no-op.
+    MECS PDF format is in use. Raises UnsupportedReportError when the PDF is
+    not a recognized MECS report, so an unrecognized drop is obviously-not-
+    silently a no-op in the upload UI.
     """
     pages = extract_pages(pdf_path)
     full_text = '\n'.join(pages)
 
-    # Refuse known-but-unsupported reports with a clear message before the
-    # format cascade below, so they don't fall through to the Setup Time
-    # default and return "no changes" from an empty parse.
-    for needle, msg in _UNSUPPORTED_REPORT_TITLES:
-        if needle in full_text:
-            raise UnsupportedReportError(msg)
-
     if _is_by_space_format(full_text):
         events = _parse_by_space_pdf(pdf_path)
         fmt = 'Daily Resources by Space'
+        report_type = 'av_resources'
     elif _is_services_by_function_format(full_text):
         events = _parse_services_by_function_date(pages)
         fmt = 'Services by Function Date'
+        report_type = 'av_resources'
     elif _is_pickup_time_format(full_text):
         all_lines: list[str] = []
         for page_text in pages:
             all_lines.extend(page_text.splitlines())
         events = _parse_lines(all_lines, pickup_order=True)
         fmt = 'Daily Resources by Pickup Time'
+        report_type = 'av_resources'
+    elif _is_event_bookings_format(full_text):
+        events = _parse_event_bookings_pdf(pages)
+        fmt = 'Event Bookings by Venue'
+        report_type = 'event_bookings'
+    elif _is_room_set_work_orders_format(full_text):
+        events = _parse_room_set_work_orders_pdf(pages)
+        fmt = 'Room Set Work Orders'
+        report_type = 'room_set_wo'
     elif 'Daily Resources by Setup Time' in full_text:
         all_lines: list[str] = []
         for page_text in pages:
             all_lines.extend(page_text.splitlines())
         events = _parse_lines(all_lines)
         fmt = 'Daily Resources by Setup Time'
+        report_type = 'av_resources'
     else:
-        # Not one of the four known formats. Returning an empty list would read
-        # as "no changes" in the UI, which is worse than failing loudly.
         raise UnsupportedReportError(
             "This PDF doesn't look like a MECS report the parser recognizes. "
             "Supported reports: Daily Resources by Setup Time, by Pickup Time, "
-            "by Space, and Services by Function Date."
+            "by Space, Services by Function Date, Event Bookings by Venue, "
+            "and Room Set Work Orders."
         )
 
     events = _dedupe_events(events)
@@ -916,6 +1171,7 @@ def extract_and_parse_pdf(pdf_path: str, pdf_source: str = '') -> list[dict]:
     label = pdf_source or os.path.basename(pdf_path)
     for ev in events:
         ev['pdf_source'] = label
+        ev['report_type'] = report_type
         ev.setdefault('layout_image', '')
         ev.setdefault('layout_images', [])
         ev.setdefault('department', '')

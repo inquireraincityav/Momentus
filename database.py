@@ -115,6 +115,11 @@ def _migrate(conn):
         ("status",         "ALTER TABLE events ADD COLUMN status TEXT DEFAULT 'active'"),
         ("hidden",         "ALTER TABLE events ADD COLUMN hidden INTEGER DEFAULT 0"),
         ("updated_at",     "ALTER TABLE events ADD COLUMN updated_at TIMESTAMP"),
+        # report_type tags each row with the originating PDF format (av_resources,
+        # event_bookings, room_set_wo) so omission-cancellation on a re-upload
+        # only wipes events of the SAME type — otherwise uploading the Event
+        # Bookings report would cancel every AV row that wasn't in it.
+        ("report_type",    "ALTER TABLE events ADD COLUMN report_type TEXT DEFAULT ''"),
     ]
     for col, sql in migrations:
         if col not in cols:
@@ -226,8 +231,8 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
                    (date, start_time, end_time, room, event_name, event_number,
                     service_type, onsite_contact, mecs_contact, setup_items, notes,
                     attendance, department, layout_image, layout_images,
-                    pdf_source, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                    pdf_source, status, report_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
                     date, start, end, room,
                     e.get('event_name', ''),
@@ -243,6 +248,7 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
                     layout_images_json,
                     e.get('pdf_source', ''),
                     status,
+                    e.get('report_type', ''),
                 )
             )
             new_count += 1
@@ -292,14 +298,32 @@ def save_events(events: list[dict]) -> tuple[int, int, int, int]:
     # Reconciling only inside [range_start, range_end] keeps a short/partial-range
     # upload from wiping events outside its window. If the PDF parsed to zero
     # events, covered_dates is empty and we cancel nothing (guards a bad parse).
+    # Omission cancellation is scoped per report_type: uploading today's Event
+    # Bookings must NOT cancel every AV row that wasn't in it (different scope).
+    # We derive the current batch's report_type from its events (all rows from
+    # one parse share a type); if absent — legacy rows, or an event with no
+    # report_type set — fall through to the old "cancel any missing row"
+    # behaviour so this stays backward-compatible with pre-tagging DBs.
+    batch_report_type = next((e.get('report_type') for e in events if e.get('report_type')), '')
     if covered_dates:
         range_start, range_end = min(covered_dates), max(covered_dates)
-        db_events = conn.execute(
-            "SELECT * FROM events WHERE date >= ? AND date <= ? "
-            "AND status != 'cancelled'",
-            (range_start, range_end),
-        ).fetchall()
+        if batch_report_type:
+            db_events = conn.execute(
+                "SELECT * FROM events WHERE date >= ? AND date <= ? "
+                "AND status != 'cancelled' AND (report_type = ? OR report_type = '')",
+                (range_start, range_end, batch_report_type),
+            ).fetchall()
+        else:
+            db_events = conn.execute(
+                "SELECT * FROM events WHERE date >= ? AND date <= ? "
+                "AND status != 'cancelled'",
+                (range_start, range_end),
+            ).fetchall()
         for row in db_events:
+            # A row with no report_type set is legacy — don't cancel it from a
+            # tagged upload, since we can't be sure which report it belonged to.
+            if batch_report_type and (row['report_type'] or '') == '':
+                continue
             key = (row['date'], row['start_time'], row['end_time'],
                    row['room'], row['service_type'])
             if key not in seen_keys:
