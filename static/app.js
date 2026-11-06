@@ -1458,15 +1458,14 @@ async function saveProgress(id) {
 
 // ── Upload ────────────────────────────────────────────────────────────────
 function initDropZone() {
-  const zone  = document.getElementById('drop-zone');
-  const input = document.getElementById('file-input');
-
-  // Re-attach handlers (modal may reopen)
+  // Re-attach handlers each time the modal opens by cloning the drop-zone
+  // (and its hidden <input>) so stale listeners from a previous open don't
+  // stack. The <label for="file-input"> in the template means the browser
+  // opens the picker on click natively — no JS-initiated .click() needed.
+  const zone = document.getElementById('drop-zone');
   const newZone = zone.cloneNode(true);
   zone.parentNode.replaceChild(newZone, zone);
   const newInput = document.getElementById('file-input');
-
-  newZone.addEventListener('click', () => newInput.click());
 
   newZone.addEventListener('dragover', e => {
     e.preventDefault();
@@ -1548,8 +1547,11 @@ async function doUploadMany(files) {
   }
 
   alert.innerHTML = batchSummaryAlert(results);
-  calendar.refetchEvents();
-  refreshBadge();
+  // Always reset the modal state back to drop-zone visible, even if something
+  // downstream throws (e.g. calendar undefined). Otherwise the modal sits on
+  // the spinner and the summary is never shown.
+  try { calendar && calendar.refetchEvents(); } catch (_) {}
+  try { refreshBadge(); } catch (_) {}
   progress.classList.add('d-none');
   zone.classList.remove('d-none');
   if (label) label.textContent = 'Extracting events …';

@@ -162,13 +162,15 @@
         <!-- Alert area -->
         <div id="upload-alert"></div>
 
-        <!-- Drop zone -->
-        <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
+        <!-- Drop zone — a <label> so clicking it opens the file picker via the
+             standard HTML mechanism, no JS-initiated .click() required (which
+             Safari can treat as not-user-initiated and silently ignore). -->
+        <label id="drop-zone" class="drop-zone" for="file-input">
           <i class="bi bi-file-earmark-arrow-up drop-icon"></i>
           <p class="mb-1 fw-semibold">Drop PDFs here or click to browse</p>
-          <p class="text-muted small mb-0">Drop all 4 reports at once — Setup Time, Pickup Time, Space, Services by Function Date. Each PDF is detected and parsed independently.</p>
+          <p class="text-muted small mb-0">Drop all 4 reports at once — Setup Time, Pickup Time, Event Bookings by Venue, Room Set Work Orders. Each PDF is detected and parsed independently.</p>
           <input type="file" id="file-input" accept=".pdf" class="d-none" multiple>
-        </div>
+        </label>
 
         <!-- Progress indicator (hidden until upload starts) -->
         <div id="upload-progress" class="d-none text-center py-3">
