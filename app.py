@@ -15,8 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import (Flask, Response, jsonify, render_template, request,
-                   send_from_directory)
+from flask import (Flask, Response, jsonify, redirect, render_template, request,
+                   send_from_directory, session, url_for)
 from werkzeug.utils import secure_filename
 
 load_dotenv()
@@ -53,10 +53,93 @@ from database import (add_note, clear_tick, count_events, count_events_in_range,
 from parser import UnsupportedReportError, extract_and_parse_pdf
 
 app = Flask(__name__)
-app.config["UPLOAD_FOLDER"] = "uploads"
+# UPLOAD_FOLDER is env-overridable so Railway can point it at a persistent
+# volume (/data/uploads) instead of the ephemeral working directory.
+app.config["UPLOAD_FOLDER"] = os.environ.get("UPLOAD_FOLDER", "uploads")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
+# SECRET_KEY signs the session cookie that carries "logged in" state. In dev
+# an auto-generated random key is fine (each restart logs everyone out, which
+# is expected locally). In production set SECRET_KEY to a long random string
+# so the cookie survives restarts.
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+# Session cookie lives 30 days of inactivity — covers a day-off without a
+# re-login — and is marked secure/httponly/samesite so it never leaks.
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Over HTTPS on Railway, mark the cookie Secure too.
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("FORCE_HTTPS", "").lower() in ("1", "true", "yes")
 
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+# Password gate: if APP_PASSWORD is set, every route except the login flow and
+# the static shell requires a logged-in session. If it isn't set, the app runs
+# unauthenticated (the localhost dev workflow, unchanged).
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
+
+
+def _auth_enabled() -> bool:
+    return bool(APP_PASSWORD)
+
+
+def _is_logged_in() -> bool:
+    return bool(session.get("logged_in"))
+
+
+_AUTH_EXEMPT_PATHS = ("/login", "/logout", "/static/", "/sw.js", "/healthz")
+
+
+@app.before_request
+def _require_login():
+    if not _auth_enabled():
+        return None
+    path = request.path or ""
+    if path in _AUTH_EXEMPT_PATHS or any(path.startswith(p) for p in _AUTH_EXEMPT_PATHS if p.endswith("/")):
+        return None
+    if _is_logged_in():
+        return None
+    # API routes get a JSON 401 so the client sees it cleanly; everything else
+    # redirects to the login page with a ?next= so the user lands where they tried to go.
+    if path.startswith("/api/") or request.method not in ("GET", "HEAD"):
+        return jsonify({"error": "unauthorized"}), 401
+    return redirect(url_for("login", next=request.full_path if request.query_string else path))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not _auth_enabled():
+        # No password configured — don't offer a login form that promises nothing.
+        return redirect(url_for("index"))
+    error = ""
+    if request.method == "POST":
+        provided = (request.form.get("password") or "").strip()
+        # Constant-time compare so timing can't leak length / content.
+        if secrets.compare_digest(provided, APP_PASSWORD):
+            session.clear()
+            session["logged_in"] = True
+            session.permanent = True
+            nxt = request.args.get("next") or request.form.get("next") or url_for("index")
+            # Only allow local redirects — strip anything that could point offsite.
+            if not nxt.startswith("/") or nxt.startswith("//"):
+                nxt = url_for("index")
+            return redirect(nxt)
+        error = "Wrong password."
+        time.sleep(0.4)  # slow down brute force on a single shared secret
+    return render_template("login.html",
+                           error=error,
+                           next_url=request.args.get("next", ""))
+
+
+@app.route("/logout", methods=["GET", "POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login") if _auth_enabled() else url_for("index"))
+
+
+@app.route("/healthz")
+def healthz():
+    """Unauthenticated health probe for the Railway health check."""
+    return jsonify({"ok": True, "auth": _auth_enabled()})
 
 # Photos attached to notes live here and are served from /note-images/<file>.
 NOTE_IMAGE_DIR = os.path.join(app.config["UPLOAD_FOLDER"], "note_images")
@@ -101,7 +184,7 @@ def _security_headers(resp: Response) -> Response:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", auth_enabled=_auth_enabled())
 
 
 @app.route("/analytics")
