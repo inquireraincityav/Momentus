@@ -663,6 +663,11 @@ body {
   padding: 0 6px;
 }
 .dept-chip.active .dept-chip-count { background: rgba(255,255,255,.25); }
+/* A pinned chip whose category has no events in the current range stays
+   clickable but mutes visually so techs don't mistake it for a "no results" bug. */
+.dept-chip.empty { opacity: .55; }
+.dept-chip.empty:hover { opacity: 1; }
+.dept-chip.empty.active { opacity: 1; }
 
 /* Status filter chip — cancelled events */
 .cancelled-chip {

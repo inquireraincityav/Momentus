@@ -710,22 +710,35 @@ function applyFilters(list) {
   });
 }
 
+// Chips pinned to the filter bar even when the current range has no events in
+// that category, so the four categories VAN cares about every day (AV, MECS,
+// Catering, Facilities) stay a single tap away and don't disappear on a slow
+// day with zero of any one of them.
+const PINNED_DEPT_CHIPS = ['AV', 'MECS', 'Catering', 'Facilities'];
+
 function buildFilterBar(list) {
-  // Department chips (with counts), sorted by frequency
+  // Department chips (with counts). Pinned chips go first in their fixed
+  // order, then whatever else is in the data, sorted by frequency.
   const counts = {};
   for (const e of list) {
     const cat = e.extendedProps.dept_category || 'General';
     counts[cat] = (counts[cat] || 0) + 1;
   }
+  for (const cat of PINNED_DEPT_CHIPS) if (!(cat in counts)) counts[cat] = 0;
   // A saved/active department with nothing in this range still gets a chip,
   // so whatever is filtering the view stays visible and can be switched off.
   for (const cat of FILTERS.depts) if (!(cat in counts)) counts[cat] = 0;
 
   const chipWrap = document.getElementById('dept-filters');
-  const cats = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
+  const extras = Object.keys(counts)
+    .filter(c => !PINNED_DEPT_CHIPS.includes(c))
+    .sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
+  const cats = PINNED_DEPT_CHIPS.concat(extras);
   const deptChips = cats.map(cat => {
     const active = FILTERS.depts.has(cat);
-    return `<button class="dept-chip${active ? ' active' : ''}"
+    const empty  = counts[cat] === 0;
+    const cls = ['dept-chip', active && 'active', empty && 'empty'].filter(Boolean).join(' ');
+    return `<button class="${cls}"
               onclick="App.toggleDept('${cat.replace(/'/g, "\\'")}')">
               ${escHtml(cat)} <span class="dept-chip-count">${counts[cat]}</span>
             </button>`;

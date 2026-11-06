@@ -47,13 +47,19 @@ def semester_of(date_str: str) -> tuple[str, int] | None:
 # ── Department bucketing (single source of truth, shared with app.py) ───────────
 
 # Checked in order against the department (provider) label.
+# AV, MECS, Catering and Facilities are the four VAN campus cares about every
+# day — pinned in the UI's filter bar even when their count is 0 for a given
+# range, so techs don't lose the chip when a slow day has no catering, etc.
 _DEPT_RULES = [
-    ("Facilities",      re.compile(r"facilit")),
-    ("AV / Production", re.compile(r"audio|a/v|sfu live")),
-    ("Security",        re.compile(r"security")),
-    ("Catering",        re.compile(r"food|beverage|cater")),
-    ("Parking",         re.compile(r"parking")),
-    ("Event Services",  re.compile(r"event services?")),
+    ("Facilities", re.compile(r"facilit")),
+    ("AV",         re.compile(r"audio|a/v|sfu live")),
+    ("Security",   re.compile(r"security")),
+    ("Catering",   re.compile(r"food|beverage|cater")),
+    ("Parking",    re.compile(r"parking")),
+    # MECS covers the venue-operator roles the Ungerboeck export emits as
+    # separate functions: "Event Services", "Event Assistant", "Room Set",
+    # "Conc Room Set / No" — all MECS staff operating the space.
+    ("MECS",       re.compile(r"event services?|event assistant|room set|conc room")),
 ]
 
 # Fallback when a booking has no provider line, so the department is blank and
@@ -61,11 +67,12 @@ _DEPT_RULES = [
 # typed "Security"). Word-bounded and stricter than the department rules,
 # since service types are free text ("Lorne Davies Gym" must not read as AV).
 _SERVICE_RULES = [
-    ("Facilities",      re.compile(r"\bfacilit|\bmaintenance\b")),
-    ("AV / Production", re.compile(r"\baudio\b|\bav\b|\ba/v\b")),
-    ("Security",        re.compile(r"\bsecurity\b|\b(un)?lock\b")),
-    ("Catering",        re.compile(r"\bcatering\b|\bfood\b|\bbeverage\b")),
-    ("Parking",         re.compile(r"\bparking\b")),
+    ("Facilities", re.compile(r"\bfacilit|\bmaintenance\b")),
+    ("AV",         re.compile(r"\baudio\b|\bav\b|\ba/v\b")),
+    ("Security",   re.compile(r"\bsecurity\b|\b(un)?lock\b")),
+    ("Catering",   re.compile(r"\bcatering\b|\bfood\b|\bbeverage\b")),
+    ("Parking",    re.compile(r"\bparking\b")),
+    ("MECS",       re.compile(r"\bevent assistant\b|\broom set\b|\bconc room\b|\bevent services?\b")),
 ]
 
 # Service types that name a department only to say it isn't needed ("No AV",
@@ -82,7 +89,7 @@ def dept_category(department: str, service_type: str) -> str:
         # categorise by the service type instead.
         d = ""
     if s.strip() == "av":
-        return "AV / Production"
+        return "AV"
     if d:
         for category, pattern in _DEPT_RULES:
             if pattern.search(d):
