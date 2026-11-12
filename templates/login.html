@@ -32,7 +32,10 @@
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="current-password"
-           autofocus required>
+           autofocus>
+    <noscript><!-- empty-password check happens server-side; dropping the
+      required= attribute avoids a Safari bug where autofilled values aren't
+      counted as "filled" and the form silently refuses to submit --></noscript>
     {% if next_url %}<input type="hidden" name="next" value="{{ next_url | e }}">{% endif %}
     <button class="btn" type="submit">Sign in</button>
   </form>
